@@ -1,0 +1,304 @@
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import matplotlib.pyplot as plt
+from datetime import datetime
+from sklearn.linear_model import LinearRegression
+from statsmodels.tsa.stattools import adfuller
+from statsmodels import api as sm
+
+def fetch_data(ticker, start_date = "2018-01-01", end_date = datetime.now().strftime('%Y-%m-%d'), interval="1d"):
+    stock = yf.Ticker(ticker)
+    data = stock.history(start=start_date, end=end_date, interval=interval)
+    return data
+
+def build_dataframe(ticker1, ticker2, benchmark_ticker="SPY", rf_ticker="^IRX"):
+    data1 = fetch_data(ticker1)['Close']
+    data2 = fetch_data(ticker2)['Close']
+    data_bench = fetch_data(benchmark_ticker)['Close']
+    data_rf = fetch_data(rf_ticker)['Close']
+    df = pd.DataFrame({ticker1: data1, ticker2: data2, benchmark_ticker: data_bench, rf_ticker: data_rf})
+    df[rf_ticker] = df[rf_ticker].ffill()  # T-bill yield doesn't print every session
+    df.dropna(inplace=True)  # Remove rows with NaN values
+    return df
+
+def adf_score(ticker1, ticker2, df):
+    df = df.copy()
+    df[[ticker1, ticker2]] = np.log(df[[ticker1, ticker2]])
+
+    coef, intercept, score = lin_regress(df[ticker1], df[ticker2])
+
+    #print(reg.predict(df[ticker1].to_numpy().reshape(-1, 1)))
+    plt.scatter(df[ticker1], df[ticker2], color='blue', label='Data Points')
+    plt.plot(df[ticker1], df[ticker1]*coef + intercept, color='red', label='Regression Line')
+    plt.show()
+
+    residuals = df[ticker2] - df[ticker1] * coef - intercept
+    plt.plot(residuals)
+    plt.show()
+
+    adf_result = adfuller(residuals)
+    adf_stat = adf_result[0]
+    p_value = adf_result[1]
+    
+    return (adf_stat, p_value)
+
+def adf_for_pair(symbol_i, symbol_j, in_sample_px):
+    # Convert raw price to log price
+    in_sample_log_px = np.log(in_sample_px)
+    
+    # Handle missing data
+    X = in_sample_log_px[symbol_i].fillna(0).values
+    Y = in_sample_log_px[symbol_j].fillna(0).values
+
+    # OLS regression
+    model = sm.OLS(Y, sm.add_constant(X)).fit()
+    alpha = model.params[0]
+    beta = model.params[1]
+    residuals = Y - beta * X - alpha
+
+    # ADF test on residuals
+    adf_result = adfuller(residuals)
+    p_value = adf_result[1]
+    test_statistic = adf_result[0]
+    
+    return (symbol_i, symbol_j), (p_value, test_statistic)
+    
+def z_scores(ticker1, ticker2, df):
+    df = np.log(df)
+
+    window = 90
+
+    rolling_cov = df[ticker1].rolling(window, min_periods=1).cov(df[ticker2])
+    rolling_var = df[ticker1].rolling(window, min_periods=1).var()
+
+    beta = rolling_cov / rolling_var
+    alpha = df[ticker2].rolling(window, min_periods=1).mean() - beta * df[ticker1].rolling(window, min_periods=1).mean()
+    residuals = df[ticker2] - (alpha + beta * df[ticker1])
+
+    residuals_mean = residuals.rolling(window, min_periods=1).mean()
+    residuals_std = residuals.rolling(window, min_periods=1).std()
+
+    z_score = (residuals - residuals_mean) / residuals_std
+
+    df['z_score'] = z_score
+    df['beta'] = beta
+    print("z-scores")
+    plt.plot(z_score)
+    plt.show()
+
+    return df
+    
+def lin_regress(X, Y):
+    X = X.to_numpy().reshape(-1, 1)
+    Y = Y.to_numpy().reshape(-1, 1)
+    reg = LinearRegression().fit(X, Y)
+    return reg.coef_[0][0], reg.intercept_[0], reg.score(X, Y)
+
+def generate_signals(ticker1, ticker2, old_df, threshold=0.2):
+    df = old_df.copy()
+
+    z_score = df['z_score']
+    beta = df['beta']
+
+    df.loc[z_score > 1, ticker1] = -1 
+    df.loc[z_score < -1, ticker1] = 1
+    df.loc[z_score.abs() < threshold, ticker1] = 0
+
+    df.loc[z_score > 1, ticker2] = beta
+    df.loc[z_score < -1, ticker2] = -beta
+    df.loc[z_score.abs() < threshold, ticker2] = 0
+
+    df = df.divide(df.abs().sum(axis=1), axis=0)
+
+    return old_df.join(df[[ticker1, ticker2]], rsuffix='_signal')
+
+def calculate_turnover(ticker1, ticker2, df):
+    turnover = df[[ticker1, ticker2]].diff().abs().sum(axis=1)
+    return turnover
+
+def calculate_daily_returns(ticker1, ticker2, df, benchmark_ticker="SPY", rf_ticker="^IRX"):
+    df[ticker1+'_returns'] = df[ticker1].pct_change()
+    df[ticker2+'_returns'] = df[ticker2].pct_change()
+    df['total_returns'] = df[ticker1+'_returns']*df[ticker1+'_signal'] + df[ticker2+'_returns']*df[ticker2+'_signal']
+    df['cumulative_returns'] = (1 + df['total_returns']).cumprod()
+
+    df[benchmark_ticker+'_returns'] = df[benchmark_ticker].pct_change()
+    df['cumulative_'+benchmark_ticker+'_returns'] = (1+df[benchmark_ticker+'_returns']).cumprod()
+
+    # ^IRX quotes an annualized T-bill discount yield in percent; convert to a daily rate
+    df['RF_returns'] = df[rf_ticker] / 100 / 252
+    df['cumulative_RF_returns'] = (1+df['RF_returns']).cumprod()
+    return df
+
+def benchmark_performance(df, benchmark_ticker="SPY"):
+    """Compare the strategy against a steady risk-free rate and against the S&P 500."""
+    returns = df['total_returns'].dropna()
+    bench_returns = df[benchmark_ticker+'_returns'].reindex(returns.index)
+    rf_returns = df['RF_returns'].reindex(returns.index)
+
+    excess_returns = returns - rf_returns
+    active_returns = returns - bench_returns
+
+    n_years = len(returns) / 252
+    ann_return = (1 + returns).prod() ** (1 / n_years) - 1
+    ann_vol = returns.std() * np.sqrt(252)
+    ann_rf = (1 + rf_returns).prod() ** (1 / n_years) - 1
+    ann_bench_return = (1 + bench_returns).prod() ** (1 / n_years) - 1
+
+    sharpe_ratio = np.sqrt(252) * excess_returns.mean() / excess_returns.std()
+
+    downside = excess_returns[excess_returns < 0]
+    sortino_ratio = np.sqrt(252) * excess_returns.mean() / downside.std()
+
+    cumulative = (1 + returns).cumprod()
+    max_drawdown = (cumulative / cumulative.cummax() - 1).min()
+
+    # CAPM-style alpha/beta vs the benchmark
+    beta, daily_alpha = np.polyfit(bench_returns, returns, 1)
+    ann_alpha = daily_alpha * 252
+
+    information_ratio = np.sqrt(252) * active_returns.mean() / active_returns.std()
+
+    metrics = {
+        "Annualized return (strategy)": ann_return,
+        "Annualized return (risk-free)": ann_rf,
+        f"Annualized return ({benchmark_ticker})": ann_bench_return,
+        "Annualized volatility (strategy)": ann_vol,
+        "Sharpe ratio (vs. risk-free)": sharpe_ratio,
+        "Sortino ratio (vs. risk-free)": sortino_ratio,
+        "Max drawdown": max_drawdown,
+        f"Beta (vs. {benchmark_ticker})": beta,
+        "Annualized alpha (CAPM)": ann_alpha,
+        f"Information ratio (vs. {benchmark_ticker})": information_ratio,
+    }
+
+    print("\n--- Benchmark performance ---")
+    for name, value in metrics.items():
+        if "ratio" in name.lower() or "beta" in name.lower():
+            print(f"{name}: {value:.3f}")
+        else:
+            print(f"{name}: {value:.2%}")
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(df['cumulative_returns'], label='Strategy')
+    plt.plot(df['cumulative_'+benchmark_ticker+'_returns'], label=benchmark_ticker)
+    plt.plot(df['cumulative_RF_returns'], label='Risk-free rate', linestyle='--')
+    plt.title('Strategy vs. Risk-Free Rate vs. Benchmark')
+    plt.xlabel('Date')
+    plt.ylabel('Cumulative Growth of $1')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return metrics
+
+def plot_with_signals(log_px_i, log_px_j, z_score, exit_threshold=0.5):
+    # Define entry signals (when z_score crosses ±1)
+    buy_signals_i = (z_score < -1)
+    sell_signals_i = (z_score > 1)
+    buy_signals_j = (z_score > 1)
+    sell_signals_j = (z_score < -1)
+
+    # Define exit signals (when z_score moves back within exit_threshold)
+    exit_signals_i = (z_score > -exit_threshold) & (z_score < exit_threshold)
+    exit_signals_j = (z_score > -exit_threshold) & (z_score < exit_threshold)
+
+    plt.figure(figsize=(14, 8))
+
+    # Plot log prices
+    plt.plot(log_px_i.index, log_px_i, label='Log Price of Asset i', color='blue', linewidth=1.5)
+    plt.plot(log_px_j.index, log_px_j, label='Log Price of Asset j', color='orange', linewidth=1.5)
+
+    # Plot z-score
+    plt.plot(z_score.index, z_score, label='Z-score', color='grey', linestyle='--', linewidth=1.2)
+
+    # Plot buy and sell signals for asset i
+    plt.plot(log_px_i.index[buy_signals_i], log_px_i[buy_signals_i], '^', color='green', label='Buy Signal for Asset i', markersize=4, linestyle='None')
+    plt.plot(log_px_i.index[sell_signals_i], log_px_i[sell_signals_i], 'v', color='red', label='Sell Signal for Asset i', markersize=4, linestyle='None')
+
+    # Plot buy and sell signals for asset j
+    plt.plot(log_px_j.index[buy_signals_j], log_px_j[buy_signals_j], '^', color='green', label='Buy Signal for Asset j', markersize=4, linestyle='None')
+    plt.plot(log_px_j.index[sell_signals_j], log_px_j[sell_signals_j], 'v', color='red', label='Sell Signal for Asset j', markersize=4, linestyle='None')
+        
+    # Add labels and legend
+    plt.title('Log Prices and Z-score with Entry and Exit Signals')
+    plt.xlabel('Date')
+    plt.ylabel('Value')
+    plt.legend(loc='best')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+ticker1 = 'XOM'
+ticker2 = 'CVX'
+df = build_dataframe(ticker1, ticker2)
+plt.plot(df[ticker1], label=ticker1)
+plt.plot(df[ticker2], label=ticker2)
+plt.legend()
+plt.show()
+#print(df.head())
+
+test_train_split = '2025-01-01'
+train_df = df[df.index < test_train_split]
+test_df = df[df.index >= test_train_split]
+score = adf_score(ticker1, ticker2, train_df)[1]
+print(score)
+if(score < 0.07):
+    print(f"{ticker1} and {ticker2} are cointegrated.")
+    test_df = z_scores(ticker1, ticker2, test_df)
+    test_df = generate_signals(ticker1, ticker2, test_df)
+    #plot_with_signals(np.log(df[ticker1]), np.log(df[ticker2]), df['z_score'])
+    turnover = calculate_turnover(ticker1, ticker2, test_df)
+    plt.plot(turnover)
+    #holding_period = 2/turnover.mean()
+    #print(holding_period)
+    test_df = calculate_daily_returns(ticker1, ticker2, test_df)
+    #print(test_df.head())
+    #output_file = "output.xlsx"
+    #df.to_excel(output_file, index=False, sheet_name="Sheet1")
+
+    score = adf_score(ticker1, ticker2, test_df)[1]
+    print("ADF score on recent data")
+    print(score)
+
+    metrics = benchmark_performance(test_df, benchmark_ticker="SPY")
+else:
+    print(f"{ticker1} and {ticker2} are not cointegrated.")
+
+
+
+'''
+#print(adf_score(ticker1, ticker2, df))
+#plt.plot(z_scores(ticker1, ticker2, df).last('1000D'))
+#plt.plot(np.log(df[ticker1]).last('1000D'))
+#plt.plot(np.log(df[ticker2]).last('1000D'))
+#plt.show()
+
+# Create figure and primary axis
+fig, ax1 = plt.subplots(figsize=(10, 6))
+
+# Plot first two lines on primary axis (left)
+color1, color2 = 'tab:blue', 'tab:orange'
+ax1.set_xlabel('X-axis')
+ax1.set_ylabel('Primary Y-axis', color=color1)
+line1, = ax1.plot(df[ticker1], color=color1, label='XOM')
+line2, = ax1.plot(df[ticker2], color=color2, label='CVX')
+ax1.tick_params(axis='y', labelcolor=color1)
+
+# Create secondary axis (right)
+ax2 = ax1.twinx()
+color3 = 'tab:green'
+ax2.set_ylabel('Secondary Y-axis', color=color3)
+line3, = ax2.plot(df['z_score'], color=color3, label='Z-Score')
+ax2.tick_params(axis='y', labelcolor=color3)
+
+# Combine legends from both axes
+lines = [line1, line2, line3]
+labels = [line.get_label() for line in lines]
+ax1.legend(lines, labels, loc='upper right')
+
+plt.title('Multiple Lines with Dual Y-Axes')
+plt.tight_layout()
+plt.show()
+'''
